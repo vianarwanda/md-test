@@ -1,591 +1,320 @@
-# TECHNICAL DESIGN DOCUMENT — PHASE 1 CORE (FRS & DATABASE SCHEMA)
-**Project Name:** One-SHW — Centralized Identity Provider (IdP) & Access Management System
-**Document Version:** v1.1
-**Database Engine:** PostgreSQL
-**Reference:** `01-REQUIREMENTS/BRD_One-SHW_Identity_Access_Management_v1.0.md`
+# Hub Supply Engine — contoh data & naratif
+
+Catatan kerja, **bukan TD**.  
+**DDL:** [hub_supply_engine.sql](../SQL/hub_supply_engine.sql).
+
+Dokumen ini pakai **ID fiktif** (prefix mudah dibaca) supaya tabel bisa dilacak antar-bab. Angka dalam **IDR** kecuali disebut lain.
 
 ---
 
-## 0. Konvensi Umum
+## Konteks trip (pemain tetap)
 
-* Semua timestamp pakai **Epoch/Unix Timestamp** dalam kolom `BIGINT` (`created_at`, `updated_at`) — sesuai **NFR-3**.
-* Semua TTL / lifetime numerik (Redis `EX`, API `session.ttl`, cookie `maxAge`, kolom `*_seconds` / `*_lifetime`) dalam **detik** (integer). Prose boleh menyebut durasi manusiawi (mis. “15 menit”) selama nilai numerik tetap dalam detik.
-* Semua secret/password **WAJIB** disimpan dalam bentuk hash, tidak boleh plaintext — sesuai **REQ-4.3.2**.
-* Kolom yang butuh pencarian cepat (hash lookup, identifier publik) di-set **UNIQUE INDEX** supaya Postgres otomatis bikin B-Tree Index — sesuai **NFR-2**.
-* Isolasi multi-tenant berbasis `realm_id` — sesuai **REQ-4.1.1**. Konsekuensinya: unique constraint untuk identifier user (email, username, no HP) di-scope **per realm**, bukan global.
+| Entitas | ID / kode | Keterangan |
+| :--- | :--- | :--- |
+| Product trip | `product-trip-7f2a` | `tour_trips` — keberangkatan 12 Jun 2026 |
+| Hub trip | `hub-trip-7f2a` | `hub.trips` — 1:1 dengan product |
+| Kode paket | **GWE-TYO-12JUN26** | 25 pax, Tokyo 5D4N |
+| Mata uang reporting | **IDR** | `planned_total_base` / `committed_total_base` |
 
----
-
-## 1. FUNCTIONAL REQUIREMENT SPECIFICATIONS (API)
-
-Berikut adalah kontrak API *Custom* yang akan dibangun di dalam **Auth Service** (Golang). API ini didesain secara *headless* untuk dikonsumsi oleh **FE SSO (Astro)**.
-
-> **Catatan OIDC Standar:** Endpoint standar bawaan Ory Fosite seperti `/oauth2/auth` (Authorization Code) dan `/oauth2/token` (Token Exchange) tidak dirincikan secara mendalam di sini karena mengikuti standar spesifikasi mutlak IETF OAuth 2.0 / OpenID Connect.
-
-### 1.1. Inisiasi / Identifikasi Pengguna (Check Username/Email)
-Langkah pertama login. FE SSO mengirimkan email/username. Backend mengecek user ada di *realm* mana, dan membuat *Stateful Auth Flow* di Redis (TTL Redis 900 detik / 15 menit).
-
-**Endpoint:** `POST /api/v1/auth/identify`
-
-**Request Payload (JSON):**
-```json
-{
-  "identifier": "user@example.com"
-}
-```
-
-**Response - Berhasil:**
-```json
-{
-  "status": "success",
-  "data": {
-    "auth_session_id": "flow-xyz-123",
-    "next_step": "AWAITING_PASSWORD",
-    "realm": "b2c_public"
-  }
-}
-```
-
-### 1.2. Cek Status Flow (Untuk Hard Refresh / SSR Astro)
-Digunakan oleh Astro SSR setiap kali halaman dimuat ulang (*hard refresh*). Astro mengirimkan `auth_session_id` dari *cookie*, dan Backend akan memberitahu halaman apa yang harus dirender agar *user* tidak terlempar kembali ke awal.
-
-**Endpoint:** `GET /api/v1/auth/flow/status?id=flow-xyz-123`
-
-**Response:**
-```json
-{
-  "status": "success",
-  "data": {
-    "current_step": "AWAITING_MFA_SELECTION",
-    "expires_in_seconds": 600,
-    "available_mfa_methods": ["email", "totp"]
-  }
-}
-```
-
-### 1.3. Validasi Kredensial (Password)
-Langkah kedua. FE SSO mengirimkan password berdasarkan `auth_session_id`.
-
-**Endpoint:** `POST /api/v1/auth/password`
-
-**Request Payload (JSON):**
-```json
-{
-  "auth_session_id": "session-xyz-123",
-  "password": "SecurePassword123!"
-}
-```
-
-**Response - Berhasil (Tanpa MFA):**
-```json
-{
-  "status": "success",
-  "data": {
-    "login_challenge": "abc-123",
-    "redirect_to": "https://auth.voyago.com/oauth2/consent?login_challenge=abc-123"
-  }
-}
-```
-
-**Response - Butuh MFA (Pilih Metode):**
-```json
-{
-  "status": "requires_mfa",
-  "message": "Silakan pilih metode Autentikasi Dua Langkah (2FA)",
-  "data": {
-    "available_methods": ["email", "totp", "webauthn"]
-  }
-}
-```
-
-### 1.4. Pilih Metode MFA (Trigger Challenge)
-Langkah ketiga (Jika user butuh MFA). FE SSO mengirimkan metode yang dipilih user. Backend akan memicu pengiriman OTP ke email atau menyiapkan *challenge* untuk FIDO2.
-
-**Endpoint:** `POST /api/v1/auth/mfa/select`
-
-**Request Payload (JSON):**
-```json
-{
-  "auth_session_id": "session-xyz-123",
-  "method": "email"
-}
-```
-
-**Response - Challenge Dikirim:**
-```json
-{
-  "status": "challenge_sent",
-  "message": "Kode OTP telah dikirimkan ke email Anda",
-  "data": {
-    "method": "email",
-    "target_masked": "u***r@example.com"
-  }
-}
-```
-
-### 1.5. Validasi MFA / OTP
-Langkah terakhir. FE SSO memvalidasi kode yang dimasukkan user.
-
-**Endpoint:** `POST /api/v1/auth/mfa/verify`
-
-**Request Payload (JSON):**
-```json
-{
-  "auth_session_id": "session-xyz-123",
-  "code": "123456"
-}
-```
-
-**Response - Berhasil:**
-```json
-{
-  "status": "success",
-  "message": "MFA berhasil diverifikasi",
-  "data": {
-    "login_challenge": "abc-123",
-    "redirect_to": "https://auth.voyago.com/oauth2/consent?login_challenge=abc-123"
-  }
-}
-```
-
-### 1.6. Logout (Akhiri Sesi)
-Digunakan untuk mencabut sesi pengguna secara sadar dari sisi IdP.
-
-**Endpoint:** `POST /api/v1/auth/logout`
-
-**Request Payload (JSON):**
-```json
-{
-  "logout_challenge": "xyz-789"
-}
-```
-
-**Response - Berhasil:**
-```json
-{
-  "status": "success",
-  "redirect_to": "https://app.voyago.com"
-}
-```
-
-### 1.7. OIDC Discovery & JWKS (Publik)
-Endpoint standar bawaan Ory Fosite yang dikonsumsi secara independen oleh **Internal API Gateway (Traefik)** dan aplikasi klien untuk memvalidasi JWT secara *stateless*.
-
-*   **Endpoint:** `GET /.well-known/openid-configuration`
-    *(Mengembalikan meta-data OIDC seperti alamat endpoint token, jwks_uri, format token, dll)*.
-*   **Endpoint:** `GET /.well-known/jwks.json`
-    *(Mengembalikan daftar Public Keys (RSA/ECDSA) untuk verifikasi signature JWT)*.
+Semua baris di bawah **`trip_id = hub-trip-7f2a`** kecuali dinyatakan lain.
 
 ---
 
-## 2. DATABASE SCHEMA (PostgreSQL)
+## Bab 1 — Planner mengisi BOM (hanya PLAN)
 
-### 2.1. ZONA 1: Multi-Tenancy (Realm Management)
+**Januari 2026.** Tim product/Ops planner menyiapkan **rencana HPP** belum ada telepon ke vendor, belum ada PNR/conf.
 
-### Tabel `realms`
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS & IDENTIFIERS ---** | | |
-| `id` | INT | PK (Di Postgres pakai `GENERATED ALWAYS AS IDENTITY`). |
-| `name` | VARCHAR(50) | NOT NULL, UNIQUE. Contoh: `b2c_public`, `tenant_alpha_corp` (REQ-4.1.1). |
-| `description` | TEXT | Optional. |
-| **--- BRANDING & UI ---** | | |
-| `brand_settings` | JSONB | Optional. Nyimpen logo_url, warna, tema, dll (REQ-4.1.2). |
-| **--- STRATEGY & SECURITY ---** | | |
-| `login_strategy` | VARCHAR(20) | Optional / Nullable. Enum: `LOCAL`, `LDAP` (Default: NULL / Bebas). LDAP = Phase 2 (REQ-4.3.9). |
-| `ldap_config` | JSONB | Optional. Konfigurasi IP, Port, Bind DN jika strategi = LDAP. |
-| `max_incorrect_password` | SMALLINT | NOT NULL, **DEFAULT 5**. Batas gagal login sebelum akun dikunci sementara (*Temporary Lock*). |
-| `lockout_duration_seconds` | INT | NOT NULL, **DEFAULT 900** (15 menit). Durasi *temporary lock*. |
-| `max_lockout_count` | SMALLINT | NOT NULL, **DEFAULT 3**. Batas maksimal *temporary lock* berturut-turut sebelum akun terkena *Permanent Lock* (harus dibuka Admin). |
-| `sso_session_idle_timeout_seconds` | INT | NOT NULL, **DEFAULT 86400** (24 jam). Batas waktu nganggur (*idle*) sebelum sesi SSO pusat hangus. |
-| `sso_session_absolute_timeout_seconds` | INT | NOT NULL, **DEFAULT 2592000** (30 hari). Batas waktu hidup absolut sesi SSO pusat (menjadi "Batas Maksimal" untuk umur Refresh Token semua aplikasi). |
-| `enforce_mfa_since` | BIGINT | Optional. Epoch format. Jika `now >= enforce_mfa_since`, semua user WAJIB setup MFA. Jika NULL, tidak dipaksa. Mendukung enforcement instan (`now`) atau terjadwal. |
-| **--- FEATURE FLAGS (UI & CAPABILITIES) ---** | | |
-| `allowed_recover_account` | BOOLEAN | NOT NULL, DEFAULT true. |
-| `allowed_change_password` | BOOLEAN | NOT NULL, DEFAULT true. |
-| `allowed_change_personal_info` | BOOLEAN | NOT NULL, DEFAULT true. |
-| `allowed_mfa` | BOOLEAN | NOT NULL, DEFAULT true. (Capability: user BOLEH nyalain MFA. Beda dengan `enforce_mfa_since` yang sifatnya memaksa). |
-| `allowed_passkey` | BOOLEAN | NOT NULL, DEFAULT true. |
-| **--- SYSTEM STATUS ---** | | |
-| `is_system` | BOOLEAN | NOT NULL, DEFAULT false. (Penanda realm bawaan pusat/super admin). |
-| `is_active` | BOOLEAN | NOT NULL, DEFAULT true. (Kill-switch kalau klien nunggak/blokir). |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
+### `hub.trip_plan_items`
 
-> **Perubahan dari draft awal:** `max_incorrect_password` default diturunkan dari 10 → 5, penambahan `lockout_duration_seconds`, penambahan `max_lockout_count` untuk eskalasi ke *Permanent Lock*, dan pengubahan `enforce_mfa` menjadi `enforce_mfa_since` untuk *window-time* (jadwal).
+| id | seq | item_kind | title | planned_qty | unit_type | planned_total_base | fulfill_status |
+| :--- | ---: | :--- | :--- | ---: | :--- | ---: | :--- |
+| `plan-01` | 1 | FLIGHT | Block seat GA 875 CGK-NRT return | 25 | PER_PAX | 375.000.000 | UNFULFILLED |
+| `plan-02` | 2 | HOTEL | Hotel Shinjuku 4★ — 10 kamar × 3 malam | 30 | PER_NIGHT | 60.000.000 | UNFULFILLED |
+| `plan-03` | 3 | TRANSFER | Bus airport ↔ hotel (1 unit 40 seat) | 1 | PER_UNIT | 8.000.000 | UNFULFILLED |
+| `plan-04` | 4 | TIPPING | Tip guide + driver (budget) | 1 | PER_TRIP | 5.000.000 | UNFULFILLED |
+| `plan-05` | 5 | ATTRACTION | Disney ticket group | 25 | PER_PAX | 37.500.000 | UNFULFILLED |
 
-### Tabel `social_login_providers` (Sistem Global)
-Tabel ini bersifat global (tidak terikat pada `realms`) untuk menyimpan kredensial OAuth 2.0 dari penyedia layanan pihak ketiga secara terpusat.
+### `hub.trip_plan_item_flights` (hanya `plan-01`)
 
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS ---** | | |
-| `id` | VARCHAR(20) | PK. Identifier provider. Contoh: `GOOGLE`, `APPLE`. |
-| **--- UI CONFIG ---** | | |
-| `name` | VARCHAR(50) | NOT NULL. Nama internal provider (contoh: "google"). |
-| `title` | VARCHAR(100) | NOT NULL. Teks untuk tombol di UI (contoh: "Sign in with Google"). |
-| `logo_base64` | TEXT | Optional. Logo provider dalam format Base64 untuk dirender langsung di UI. |
-| **--- OAUTH CREDENTIALS ---** | | |
-| `client_id` | VARCHAR(255) | NOT NULL. Client ID dari provider OAuth. |
-| `client_secret` | TEXT | NOT NULL. Client Secret dari provider. **Wajib dienkripsi** (AES-GCM/Encrypted-at-Rest) karena backend butuh nilai aslinya (plaintext) saat memanggil API provider. |
-| **--- SYSTEM STATUS ---** | | |
-| `is_active` | BOOLEAN | NOT NULL, DEFAULT true. Tombol otomatis hilang dari UI SSO jika false. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
+| plan_item_id | flight_mode | seats | price_per_pax | deposit_per_seat | planned (implicit) |
+| :--- | :--- | ---: | ---: | ---: | :--- |
+| `plan-01` | GIT | 25 | 15.000.000 | 2.000.000 | 375 jt total block |
+
+**Narasi:** Di UI tab **Plan**, Bos melihat **total budget HPP rencana ≈ Rp 485,5 juta** (jumlah baris di atas). Belum ada baris di `fulfillments` — ini **kertas kerja**, bukan kenyataan vendor.
 
 ---
 
-### 2.2. ZONA 2: Identity & Keamanan (Users & Credentials)
+## Bab 2 — Hotel Tokyo: satu rencana, dua vendor (split fulfill)
 
-### Tabel `users` (Biodata — Single Source of Truth Identity)
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS & RELATIONS ---** | | |
-| `id` | UUID | PK. |
-| **--- PERSONAL INFO (BIODATA) ---** | | |
-| `first_name` | VARCHAR(100) | NOT NULL. |
-| `middle_name` | VARCHAR(100) | Optional. |
-| `last_name` | VARCHAR(100) | Optional. |
-| `gender` | VARCHAR(1) | **Optional.** Check: IN ('M', 'F'). |
-| `date_of_birth` | DATE | **Optional.** |
-| **--- PRIMARY CONTACTS ---** | | |
-| `primary_email` | VARCHAR(100) | Optional. |
-| `country_code` | VARCHAR(5) | Optional. |
-| `mobile_no` | VARCHAR(15) | Optional. |
-| **--- ADDITIONAL DETAILS ---** | | |
-| `profile_picture` | TEXT | Optional. |
-| `additional_info` | TEXT | Optional. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
+**Februari 2026.** Ops booking hotel. Agoda B2B cuma punya **8 kamar**; **2 kamar** dipesan langsung ke hotel (lebih mahal).
 
-> **Perubahan dari draft awal:** `gender` dan `date_of_birth` dilonggarkan jadi Optional. Alasannya REQ-4.3.8 (Social Login masuk Phase 1 MVP): Google/Apple cuma ngasih nama + email saat federated onboarding. Kalau dua kolom ini NOT NULL, flow "seamless B2C onboarding" (Persona: Budi) bakal patah karena user dipaksa isi form dulu. Data ini bisa dilengkapi belakangan via progressive profiling.
+### `hub.fulfillments`
 
-### Tabel `user_credentials`
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS & RELATIONS ---** | | |
-| `user_id` | UUID | PK, FK ke `users.id`. |
-| `realm_id` | INT | NOT NULL, FK ke `realms.id`. |
-| **--- IDENTIFIERS ---** | | |
-| `email` | VARCHAR(100) | NOT NULL. (Primary login, REQ-4.3.1). UNIQUE INDEX **(realm_id, email)**. |
-| `username` | VARCHAR(30) | Optional. UNIQUE INDEX **(realm_id, username)**. |
-| `country_code` | VARCHAR(5) | Optional. |
-| `mobile_no` | VARCHAR(15) | Optional. |
-| **--- AUTH & SECURITY ---** | | |
-| `password_hash` | TEXT | Optional (Bcrypt/Argon2, REQ-4.3.2). Khusus strategi `LOCAL`. NULL kalau user murni social login. |
-| `login_attempt` | SMALLINT | NOT NULL, DEFAULT 0. (Counter salah password). |
-| `use_2fa` | BOOLEAN | NOT NULL, DEFAULT false. |
-| `totp_secret` | TEXT | Optional. Shared secret TOTP (REQ-4.3.4), disimpan **encrypted-at-rest** (AES-GCM), bukan plaintext. |
-| `last_activated_2fa_at` | BIGINT | Optional. Epoch format. |
-| `last_change_password_at` | BIGINT | Optional. Epoch format. |
-| **--- STATUS & CONTROL ---** | | |
-| `force_change_password` | BOOLEAN | NOT NULL, DEFAULT true. |
-| `locked_until` | BIGINT | Optional. Epoch. Temporary lock: diisi `now + realms.lockout_duration_seconds` saat `login_attempt` mencapai batas. Login ditolak selama `now < locked_until`. |
-| `lockout_count` | SMALLINT | NOT NULL, DEFAULT 0. Counter berapa kali akun ini terkena *temporary lock*. Jika mencapai `realms.max_lockout_count`, status dilempar ke `is_locked = true`. Reset ke 0 jika login sukses. |
-| `is_locked` | BOOLEAN | NOT NULL, DEFAULT false. **Permanent Lock** (Oleh sistem akibat eskalasi *brute-force*, atau manual oleh Admin via *Kill-Switch*). |
-| `deleted_at` | BIGINT | Optional. Epoch format. (Soft Delete ORM-friendly — Nullable, NFR-02). |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
+| id | seq | fulfillment_kind | coverage | supplier_name | vendor_reference | status | committed_total_base |
+| :--- | ---: | :--- | :--- | :--- | :--- | :--- | ---: |
+| `ful-01` | 1 | HOTEL | PLANNED | Agoda B2B | `AGD-TYO-8821` | CONFIRMED | 48.000.000 |
+| `ful-02` | 2 | HOTEL | PLANNED | Hotel Shinjuku Direct | `HTL-SJK-4410` | CONFIRMED | 15.000.000 |
 
-*(Wajib bikin UNIQUE INDEX untuk combo: `realm_id` + `country_code` + `mobile_no`)*
+### `hub.fulfillment_lines`
 
-### Tabel `user_federated_identities` (Social Login — BARU, Phase 1 MVP)
-Wajib ada di Phase 1 karena REQ-4.3.8 (Social Login via Google/Apple) masuk scope MVP.
+| id | fulfillment_id | plan_item_id | fulfilled_qty | allocated_cost_base | Catatan |
+| :--- | :--- | :--- | ---: | ---: | :--- |
+| `fl-01` | `ful-01` | `plan-02` | 24 | 48.000.000 | 8 kamar × 3 malam = 24 room-nights |
+| `fl-02` | `ful-02` | `plan-02` | 6 | 15.000.000 | 2 kamar × 3 malam = 6 room-nights |
 
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS & RELATIONS ---** | | |
-| `id` | UUID | PK. |
-| `user_id` | UUID | NOT NULL, FK ke `users.id`. |
-| `realm_id` | INT | NOT NULL, FK ke `realms.id`. |
-| **--- PROVIDER IDENTITY ---** | | |
-| `provider` | VARCHAR(20) | NOT NULL. Enum: `GOOGLE`, `APPLE`. (Extensible untuk provider lain). |
-| `provider_user_id` | VARCHAR(255) | NOT NULL. `sub` claim dari ID Token provider. |
-| `provider_email` | VARCHAR(100) | Optional. Email dari provider saat linking (buat troubleshooting/display). |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
+### Update plan (hasil rollup BE)
 
-### Tabel `user_passkeys` (FIDO2/WebAuthn — Schema Phase 1, Aktivasi Phase 2)
-Sesuai REQ-4.3.3: struktur disiapkan sejak Phase 1 biar nggak ada migrasi besar di Phase 2.
+| plan_item_id | fulfill_status | Alasan |
+| :--- | :--- | :--- |
+| `plan-02` | **FULFILLED** | 24 + 6 = **30** room-nights = `planned_qty` |
 
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| `id` | UUID | PK. |
-| `user_id` | UUID | NOT NULL, FK ke `users.id`. |
-| `name` | VARCHAR(100) | Optional. Label device buat UI. Contoh: "iPhone Vian", "YubiKey Kantor". |
-| `credential_id` | TEXT | NOT NULL, **UNIQUE INDEX**. ID Passkey dari browser/HP. |
-| `public_key` | TEXT | NOT NULL. Kunci kriptografi validasi. |
-| `sign_count` | INT | NOT NULL, DEFAULT 0. Validasi FIDO anti-cloning (penjelasan di bawah). |
-| `last_used_at` | BIGINT | Optional. Epoch format. |
-| `is_active` | BOOLEAN | NOT NULL, DEFAULT true. (Revoke device tanpa hapus histori). |
-| `created_at` | BIGINT | NOT NULL. Epoch format (NFR-3). |
-| `updated_at` | BIGINT | Optional. Epoch format (NFR-3). |
+### `hub.fulfillment_detail_fields` (cuplikan fulfill `ful-02`)
+
+| fulfillment_id | field_key | field_value |
+| :--- | :--- | :--- |
+| `ful-02` | `hotel.phone` | +81-3-1234-5678 |
+| `ful-02` | `hotel.address` | 2-1-1 Shinjuku, Tokyo |
+
+**Narasi:** **Satu baris plan** hotel tetap utuh sebagai **budget Januari (60 jt)**. Lapangan **dua surat jalan vendor** → dua header `fulfillments`. Variance **committed vs budget** untuk `plan-02`:
+
+| Metrik | Nilai |
+| :--- | ---: |
+| Budget (plan) | 60.000.000 |
+| Committed (Σ allocated pada plan-02) | **63.000.000** |
+| Selisih | **−3.000.000** (overbudget deal) |
+
+Checklist **VERIFY** hotel → `status = CONFIRMED`, `confirmed_at` terisi; **uang belum keluar** sampai Bab 6.
 
 ---
 
-## 2.3. ZONA 3: Application Management, Dynamic RBAC & Otorisasi (IAM)
+## Bab 3 — Flight GIT: plan komersial + PNR + segments
 
-### Tabel `apps` (Profil Aplikasi & Konfigurasi)
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS & IDENTIFIERS ---** | | |
-| `id` | UUID | PK. |
-| `realm_id` | INT | NOT NULL, FK ke `realms.id`. Aplikasi terdaftar di bawah satu realm (tenant isolation, REQ-4.1.1). |
-| `client_id` | VARCHAR(150) | NOT NULL, UNIQUE INDEX. Identifier publik aplikasi. |
-| **--- APP PROFILE ---** | | |
-| `name` | VARCHAR(150) | NOT NULL. Contoh: "Voyago Web". |
-| `brand_url` | TEXT | Optional. |
-| **--- OAUTH 2.0 CONFIG ---** | | |
-| `redirect_uris` | JSONB | NOT NULL. Array whitelist callback URI. **Wajib** buat validasi `redirect_uri` di Authorization Code flow (Bab 4.6 Step 2 & 4) — tanpa ini rawan Open Redirect attack. |
-| `backchannel_logout_uri` | TEXT | Optional. Endpoint BFF yang di-notify IdP saat Single Logout (Bab 4.6 Step 7). |
-| **--- CONFIG & LIFETIME ---** | | |
-| `max_access_token_lifetime` | INT | NOT NULL, DEFAULT 3600. Umur JWT dalam detik. **Aturan:** Nilainya wajib lebih kecil atau sama dengan (`<=`) `max_refresh_token_lifetime`. |
-| `max_refresh_token_lifetime` | INT | NOT NULL, DEFAULT 2592000 (30 hari). Umur refresh token dalam detik. **Aturan:** Nilainya wajib lebih kecil atau sama dengan (`<=`) `realms.sso_session_absolute_timeout_seconds`. |
-| **--- SYSTEM STATUS ---** | | |
-| `is_system` | BOOLEAN | NOT NULL, DEFAULT false. Cegah app bawaan dihapus. |
-| `is_active` | BOOLEAN | NOT NULL, DEFAULT true. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
+**Februari 2026.** Ops block seat GA; PNR keluar; jadwal paste dari GDS.
 
-### Tabel `app_secrets` (Wadah Secret Rotation)
-Mendukung **Zero-Downtime Secret Rotation** (REQ-4.2.2): satu app boleh punya beberapa secret aktif sekaligus selama masa transisi.
+### `hub.fulfillments`
 
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS ---** | | |
-| `id` | UUID | PK. |
-| `app_id` | UUID | NOT NULL. FK ke `apps.id`. |
-| **--- CREDENTIALS ---** | | |
-| `client_secret_hash` | VARCHAR(255) | NOT NULL, **UNIQUE INDEX**. Disimpan dalam bentuk Hash (Bcrypt/Argon2). JANGAN simpan plain text. |
-| `description` | TEXT | Optional. Contoh: "Secret V1", "Rotasi Q3 2026". |
-| **--- LIFETIME & STATUS ---** | | |
-| `expires_at` | BIGINT | Optional (Epoch). Kalau NULL = aktif selamanya. Kalau terisi = secret ini mati otomatis (masa transisi rotasi, REQ-4.2.2). |
-| `is_active` | BOOLEAN | NOT NULL, DEFAULT true. Buat matiin secret lama (Revoke). |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
+| id | seq | fulfillment_kind | coverage | vendor_reference | status | committed_total_base |
+| :--- | ---: | :--- | :--- | :--- | :--- | ---: |
+| `ful-10` | 3 | FLIGHT | PLANNED | `7V9VKN` | BOOKED | 375.000.000 |
 
-### Tabel `user_api_keys` (Personal Access Tokens — Schema Phase 1, Aktivasi Phase 2)
-Sesuai Bab 2: schema disiapkan di Phase 1, UI generation & middleware validasi aktif di Phase 2.
+### `hub.fulfillment_lines`
 
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS ---** | | |
-| `id` | UUID | PK. |
-| `user_id` | UUID | NOT NULL. FK ke `users.id`. |
-| **--- CREDENTIALS ---** | | |
-| `name` | VARCHAR(100) | NOT NULL. |
-| `api_key_hash` | VARCHAR(255) | NOT NULL, **UNIQUE INDEX**. **SHA-256** (REQ-4.5.2) — deterministic hash, bukan Bcrypt, supaya bisa exact-match lookup lewat B-Tree index (NFR-2). Plaintext key cuma ditampilkan SEKALI saat creation. |
-| `key_prefix` | VARCHAR(20) | NOT NULL. Prefix statis, contoh: `shw_prod_`, `shw_test_` (REQ-4.5.3 — buat visual dashboard & secret scanning). |
-| **--- STATUS & TRACKING ---** | | |
-| `expires_at` | BIGINT | Optional (Epoch). |
-| `last_used_at` | BIGINT | Optional (Epoch). |
-| `is_active` | BOOLEAN | NOT NULL, DEFAULT true. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
+| fulfillment_id | plan_item_id | fulfilled_qty | allocated_cost_base |
+| :--- | :--- | ---: | ---: |
+| `ful-10` | `plan-01` | 25 | 375.000.000 |
 
-### Tabel `api_key_permissions` (Scoping API Key — BARU)
-Wajib ada untuk REQ-4.5.4 (**Least Privilege**): akses API Key dibatasi hanya ke scope yang di-assign, meskipun user pemiliknya punya permission lebih luas.
+### `hub.fulfillment_flight_segments` (replace-set)
 
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS (COMPOSITE PK) ---** | | |
-| `api_key_id` | UUID | PK & FK ke `user_api_keys.id`. |
-| `permission_id` | UUID | PK & FK ke `permissions.id`. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
+| fulfillment_id | seq | airline | flight | org | dest | departure_at (UTC+9) |
+| :--- | ---: | :--- | :--- | :--- | :--- | :--- |
+| `ful-10` | 1 | GA | 875 | CGK | NRT | 2026-06-12 06:10 |
+| `ful-10` | 2 | GA | 876 | NRT | CGK | 2026-06-16 18:30 |
 
-### Tabel `permissions` (Daftar Aksi / Tombol — Data untuk Dynamic RBAC)
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS & RELATIONS ---** | | |
-| `id` | UUID | PK. |
-| `app_id` | UUID | NOT NULL. FK ke `apps.id`. (Permission nempel per aplikasi — REQ-4.4.1, hardcoded actions). |
-| **--- DETAILS ---** | | |
-| `name` | VARCHAR(150) | NOT NULL. Contoh: `submit_timesheet`, `view_payslip`. |
-| `description` | VARCHAR(255) | Optional. Penjelasan buat di UI Dashboard Admin. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
+**Narasi:** **Uang & seat** tetap di **plan** (`trip_plan_item_flights`). **PNR & jadwal** hidup di **fulfill** — bukan di plan. Reschedule Juni (TK time change): **PNR sama**, segments di-replace; `ful-10.id` stabil → checklist deposit/issued tidak putus.
 
-### Tabel `roles` (Jabatan / Kantong Akses)
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS & RELATIONS ---** | | |
-| `id` | UUID | PK. |
-| `realm_id` | INT | NOT NULL, FK ke `realms.id`. |
-| `app_id` | UUID | **Optional (Nullable)**, FK ke `apps.id`. **NULL = Realm-level role** (berlaku di semua app dalam realm). **Terisi = Client-level role** (spesifik satu app). Sesuai REQ-4.4.4. |
-| **--- DETAILS ---** | | |
-| `name` | VARCHAR(150) | NOT NULL. Contoh: "Tenaga Kerja", "Voyago Admin". |
-| `description` | VARCHAR(255) | Optional. |
-| **--- SYSTEM STATUS ---** | | |
-| `is_custom` | BOOLEAN | NOT NULL, DEFAULT true. Penanda role buatan user atau bawaan sistem/hardcoded. |
-| `is_active` | BOOLEAN | NOT NULL, DEFAULT true. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-| `updated_at` | BIGINT | Optional. Epoch format. |
-
-### Tabel `role_permissions` (Penyambung Jabatan & Aksi)
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS (COMPOSITE PK) ---** | | |
-| `role_id` | UUID | PK & FK ke `roles.id`. |
-| `permission_id` | UUID | PK & FK ke `permissions.id`. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
-
-### Tabel `user_roles` (Pemberian Jabatan ke User)
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS (COMPOSITE PK) ---** | | |
-| `user_id` | UUID | PK & FK ke `users.id`. |
-| `role_id` | UUID | PK & FK ke `roles.id`. |
-| **--- AUDIT ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
+| plan-01 fulfill_status | FULFILLED (qty pax ter-cover 25/25) |
 
 ---
 
-## 2.4. ZONA 4: Audit & Compliance
+## Bab 4 — BUNDLED: rute tanpa pembelian seat terpisah
 
-### Tabel `audit_logs` (BARU — Wajib per NFR-5)
-Log **immutable**: aplikasi cuma boleh INSERT. Nggak ada `updated_at`, dan role DB aplikasi jangan dikasih grant UPDATE/DELETE di tabel ini.
+Planner tambah **penerbangan sudah termasuk paket land** (wholesale sudah bayar tiket).
 
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| **--- KEYS ---** | | |
-| `id` | BIGINT | PK (`GENERATED ALWAYS AS IDENTITY`). Volume tinggi, BIGSERIAL lebih hemat & cepat daripada UUID. |
-| `realm_id` | INT | Optional. FK ke `realms.id`. NULL untuk event global/sistem. |
-| **--- WHO (ACTOR) ---** | | |
-| `actor_type` | VARCHAR(20) | NOT NULL. Enum: `USER`, `SYSTEM`, `API_KEY`, `APP`. |
-| `actor_id` | VARCHAR(100) | Optional. User ID / App ID / identifier lain sesuai actor_type. |
-| **--- WHAT (ACTION & RESOURCE) ---** | | |
-| `action` | VARCHAR(100) | NOT NULL. Contoh: `LOGIN_SUCCESS`, `LOGIN_FAILED`, `PASSWORD_CHANGED`, `MFA_ENABLED`, `CLIENT_SECRET_ROTATED`, `ROLE_PERMISSION_ADDED`. |
-| `resource_type` | VARCHAR(50) | Optional. Contoh: `USER`, `APP`, `ROLE`. |
-| `resource_id` | VARCHAR(100) | Optional. ID resource yang kena efek. |
-| `status` | VARCHAR(10) | NOT NULL. Enum: `SUCCESS`, `FAILURE`. |
-| **--- WHERE (SOURCE & TRACE) ---** | | |
-| `ip_address` | INET | Optional. Source IP request. |
-| `user_agent` | TEXT | Optional. |
-| `trace_id` | VARCHAR(100) | Optional. OpenTelemetry Trace ID untuk distributed tracing (NFR-01). |
-| **--- DETAIL ---** | | |
-| `metadata` | JSONB | Optional. Konteks tambahan (misal: reason failure, old/new value non-sensitif). |
-| **--- WHEN ---** | | |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
+### Plan tambahan
 
-*(Index yang disarankan: `(realm_id, created_at DESC)` untuk dashboard per tenant, dan `(actor_id, created_at DESC)` untuk trace aktivitas per user. Kalau volume udah gede, pertimbangkan table partitioning by range `created_at`).*
+| id | item_kind | title | planned_total_base | fulfill_status |
+| :--- | :--- | :--- | ---: | :--- |
+| `plan-06` | FLIGHT | Info rute — included in DMC package | **0** | UNFULFILLED |
+
+### Fulfill (BUNDLED-style)
+
+| id | fulfillment_kind | coverage | vendor_reference | status | committed_total_base |
+| :--- | :--- | :--- | :--- | :--- | ---: |
+| `ful-11` | FLIGHT | PLANNED | *(NULL)* | DRAFT | 0 |
+
+Segments diisi untuk **papan keberangkatan**; tidak ada Request Payment dari fulfill ini. HPP tiket sudah di baris **WHOLESALE** (contoh di Bab 7).
 
 ---
 
-## 2.5. ZONA 5: Session & Refresh Token (Persistent Storage)
+## Bab 5 — Bus 40 seat rencana → 2× bus 20 seat (split fulfill)
 
-> **Arsitektur Hybrid (Postgres + Redis):** Sesuai dengan NFR-04, validasi *hot path* untuk sesi dan *refresh token* dikelola di **Redis** (In-Memory Cache) demi *horizontal scaling*. Namun, data tetap di-*insert* ke tabel Postgres di bawah ini sebagai *Source of Truth* (Persistent Storage) untuk kebutuhan *audit trail*, *dashboard* pengelolaan sesi aktif (seperti fitur "Log out from all devices"), dan ketahanan data (*failover*) apabila data di Redis terhapus/mengalami *eviction*.
+**Maret 2026.** Vendor transfer bilang bus 40 seat habis; dikirim **2 bus 20 seat** (beda polisi).
 
-### Tabel `sso_sessions`
-Merepresentasikan satu sesi login user di IdP (basis untuk SSO & SLO).
+### Fulfillments
 
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| `id` | UUID | PK. (Session ID, masuk sebagai `sid` claim di JWT untuk keperluan back-channel logout). |
-| `user_id` | UUID | NOT NULL, FK ke `users.id`. |
-| `realm_id` | INT | NOT NULL, FK ke `realms.id`. |
-| `ip_address` | INET | Optional. |
-| `user_agent` | TEXT | Optional. |
-| `last_active_at` | BIGINT | NOT NULL. Epoch. Diperbarui (*heartbeat*) setiap kali ada rotasi *Refresh Token* dari aplikasi klien. Basis untuk mengecek *Idle Timeout*. |
-| `expires_at` | BIGINT | NOT NULL. Epoch. Basis untuk mengecek *Absolute Timeout*. |
-| `revoked_at` | BIGINT | Optional. Epoch. Terisi saat logout / SLO — semua refresh token di bawah session ini otomatis mati. |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
+| id | fulfillment_kind | coverage | vendor_reference | status | committed_total_base |
+| :--- | :--- | :--- | :--- | :--- | ---: |
+| `ful-20` | TRANSFER | PLANNED | `TRF-BUS-A` | CONFIRMED | 4.200.000 |
+| `ful-21` | TRANSFER | PLANNED | `TRF-BUS-B` | CONFIRMED | 4.500.000 |
 
-### Tabel `refresh_tokens` (Dukungan Refresh Token Rotation / RTR)
-| Column | Type | Notes |
-| ------ | ---- | ----- |
-| `id` | UUID | PK. |
-| `session_id` | UUID | NOT NULL, FK ke `sso_sessions.id`. |
-| `app_id` | UUID | NOT NULL, FK ke `apps.id`. |
-| `token_hash` | VARCHAR(255) | NOT NULL, **UNIQUE INDEX**. SHA-256 dari token — lookup cepat via B-Tree (NFR-2), aman kalau DB bocor. |
-| `parent_id` | UUID | Optional, FK ke `refresh_tokens.id`. Rantai rotasi: token baru nunjuk ke token lama. **Deteksi reuse:** kalau token yang udah punya anak (sudah dirotasi) dipakai lagi = indikasi pencurian → revoke seluruh rantai + session. |
-| `expires_at` | BIGINT | NOT NULL. Epoch (dari `apps.max_refresh_token_lifetime`). |
-| `revoked_at` | BIGINT | Optional. Epoch. Terisi saat token dirotasi (RTR) atau di-revoke. |
-| `created_at` | BIGINT | NOT NULL. Epoch format. |
+### Fulfillment lines (keduanya ke **plan-03**)
 
----
+| fulfillment_id | plan_item_id | fulfilled_qty | allocated_cost_base |
+| :--- | :--- | ---: | ---: |
+| `ful-20` | `plan-03` | 0.5 | 4.200.000 |
+| `ful-21` | `plan-03` | 0.5 | 4.500.000 |
 
-## Catatan Implementasi Tambahan (Non-Tabel)
+*(Policy contoh: `planned_qty = 1` PER_UNIT bus; **fulfilled_qty** pecah proporsi 0,5 + 0,5 = 1 unit terpenuhi — BE bisa juga pakai qty=1+1 dengan unit PER_UNIT dan flag over-unit; yang penting **M:N mental**.)*
 
-* **Data Transien (Recovery Token, Auth Code, OTP):** Entitas yang bersifat *single-use* dan *short-lived* (TTL Redis dalam detik) murni disimpan di **Redis dengan TTL** tanpa masuk ke Postgres. Hal ini memanfaatkan fitur auto-expire dan operasi *atomic* (contoh: `GETDEL`) pada Redis, sehingga terbebas dari beban *cleanup job* di sisi *database*.
-* **Reset `login_attempt`**: counter di-reset ke 0 setiap login sukses, atau setelah `locked_until` terlewati.
-* **Kepatuhan UU PDP (Data Retention - NFR-03)**: Karena sistem menyimpan *Personally Identifiable Information* (PII), diwajibkan untuk menerapkan *Cron Job / Background Worker* berkala yang melakukan pembersihan data (*Hard Delete* atau *Data Masking* secara permanen) terhadap baris-baris data yang sudah melewati batas waktu *Soft Delete* (`deleted_at`) yang diatur oleh tim legal.
+### Detail fields
+
+| fulfillment_id | field_key | field_value |
+| :--- | :--- | :--- |
+| `ful-20` | `transfer.plate_no` | B 1234 XYZ |
+| `ful-21` | `transfer.plate_no` | B 5678 XYZ |
+
+| plan-03 fulfill_status | FULFILLED |
+| Committed vs budget 8 jt | **8,7 jt** (+700 rb) |
 
 ---
 
-## Entity Relationship Diagram (ERD)
+## Bab 6 — Satu invoice DMC, dua baris plan (merge fulfill)
 
-```mermaid
-erDiagram
-    realms ||--o{ user_credentials : "scopes"
-    realms ||--o{ apps : "owns"
-    realms ||--o{ roles : "scopes"
-    realms ||--o{ user_federated_identities : "scopes"
-    realms ||--o{ audit_logs : "contextualizes"
+DMC **Sakura Travel** mengirim **satu invoice** untuk **land wholesale + visa grup** (dekat ke lapangan).
 
-    users ||--|| user_credentials : "has"
-    users ||--o{ user_federated_identities : "links"
-    users ||--o{ user_passkeys : "registers"
-    users ||--o{ user_api_keys : "generates"
-    users ||--o{ user_roles : "assigned"
+### Plan (sudah ada dari Bab 1)
 
-    apps ||--o{ app_secrets : "rotates"
-    apps ||--o{ permissions : "defines"
-    apps ||--o{ roles : "scopes (client-level)"
+| id | item_kind | title | planned_total_base |
+| :--- | :--- | ---: |
+| `plan-07` | WHOLESALE_PACKAGE | Land + meal DMC Tokyo | 120.000.000 |
+| `plan-08` | VISA | Visa grup Jepang | 12.500.000 |
 
-    roles ||--o{ role_permissions : "bundles"
-    permissions ||--o{ role_permissions : "granted-via"
-    roles ||--o{ user_roles : "held-by"
+### Satu fulfillment, dua lines
 
-    user_api_keys ||--o{ api_key_permissions : "scoped-by"
-    permissions ||--o{ api_key_permissions : "limits"
+| id | coverage | supplier_name | vendor_reference | status | committed_total_base |
+| :--- | :--- | :--- | :--- | :--- | ---: |
+| `ful-30` | **MIXED** | Sakura Travel | `DMC-2026-0192` | BOOKED | 132.500.000 |
 
-    users ||--o{ sso_sessions : "opens (draft)"
-    sso_sessions ||--o{ refresh_tokens : "issues (draft)"
-    apps ||--o{ refresh_tokens : "bound-to (draft)"
+| fulfillment_id | plan_item_id | fulfilled_qty | allocated_cost_base |
+| :--- | :--- | ---: | ---: |
+| `ful-30` | `plan-07` | 1 | 120.000.000 |
+| `ful-30` | `plan-08` | 25 | 12.500.000 |
+
+**Narasi:** **Satu PNR/invoice vendor** → **satu header fulfill**; alokasi ke **dua plan item**. Finance PO/bill bisa satu dokumen dengan `fulfillment_id = ful-30`; variance per plan item dihitung dari **allocated**, bukan dari header dobel.
+
+---
+
+## Bab 7 — Tipping: lewat plan vs langsung expense
+
+### 7A — Path plan → fulfill (terencana)
+
+| Plan `plan-04` | Budget 5 jt TIPPING |
+| Fulfill `ful-40` | Vendor TL Tokyo, ref `TIP-TL-01`, committed 5 jt, CONFIRMED |
+| Line | `plan-04` ← 100% allocated 5 jt |
+
+Ops **Request Payment** → Finance bill → event ke Hub:
+
+### `hub.fulfillment_cash_events` (cuplikan)
+
+| fulfillment_id | finance_doc_kind | finance_doc_id | event_kind | paid_amount_base | occurred_at |
+| :--- | :--- | :--- | :--- | ---: | :--- |
+| `ful-40` | VENDOR_BILL | `fin-bill-901` | SETTLEMENT | 5.000.000 | 2026-04-10 |
+
+### 7B — Path langsung expense (tanpa plan)
+
+**Di lapangan**, TL bayar tip parkir cash **Rp 350.000** — tidak sempat buat plan.
+
+Finance posting:
+
+| Tabel finance | `expenses.id = fin-exp-772`, `trip_id = hub-trip-7f2a`, POSTED |
+
+Hub ingest (read model):
+
+### `hub.trip_cost_links`
+
+| trip_id | finance_doc_kind | finance_doc_id | plan_item_id | title_snapshot | amount_base | occurred_at |
+| :--- | :--- | :--- | :--- | :--- | ---: | :--- |
+| `hub-trip-7f2a` | EXPENSE | `fin-exp-772` | *(NULL)* | Tip parkir cash TL | 350.000 | 2026-06-13 |
+
+**Narasi:** **Tipping bisa keduanya.** Dashboard trip: budget tip **5 jt** (plan) + **350 rb** (direct cost) = **realized tip spend** terpisah dari committed fulfill `ful-40` sampai bill lunas.
+
+---
+
+## Bab 8 — Fulfill tanpa plan (unplanned)
+
+**Di Tokyo**, bus parah; Ops sewa bus pengganti **tanpa baris plan**.
+
+### `hub.fulfillments`
+
+| id | coverage | fulfillment_kind | vendor_reference | status | committed_total_base |
+| :--- | :--- | :--- | :--- | :--- | ---: |
+| `ful-50` | **UNPLANNED** | TRANSFER | `EMRG-BUS-01` | BOOKED | 6.000.000 |
+
+### `hub.fulfillment_lines`
+
+| fulfillment_id | plan_item_id | fulfilled_qty | allocated_cost_base |
+| :--- | :--- | ---: | ---: |
+| `ful-50` | **NULL** | 1 | 6.000.000 |
+
+**Narasi:** **Common** untuk emergency. Trip P&L: **+6 jt committed** tanpa budget plan sebelumnya. Ops bisa later **menambah plan retroaktif** (policy produk) atau biarkan murni **unplanned cost**. Finance tetap bayar lewat bill → `fulfillment_cash_events`.
+
+---
+
+## Bab 9 — Realisasi uang (timeline ringkas)
+
+Gabungan event **fulfill path** + **direct cost** (contoh seleksi):
+
+| Tanggal | Sumber | ID | Jenis | paid_amount_base | Keterangan |
+| :--- | :--- | :--- | :--- | ---: | :--- |
+| 2026-03-01 | fulfill | `ful-10` | ADVANCE | 50.000.000 | DP seat GA (25×2 jt) |
+| 2026-04-10 | fulfill | `ful-40` | SETTLEMENT | 5.000.000 | Tip TL bill |
+| 2026-04-15 | fulfill | `ful-01` | SETTLEMENT | 48.000.000 | Pelunasan Agoda |
+| 2026-06-13 | trip_cost | `fin-exp-772` | EXPENSE | 350.000 | Tip cash |
+| 2026-06-20 | fulfill | `ful-10` | SETTLEMENT | 325.000.000 | Pelunasan block seat |
+
+**Narasi:** Hub **tidak** jadi SoT pembayaran — hanya **mirror** untuk Ops/Bos. SoT tetap **finance**.
+
+---
+
+## Bab 10 — Cancel fulfill: plan kembali partial
+
+Hotel Direct (`ful-02`) **dibatalkan** vendor; 6 room-nights harus dicari lagi.
+
+| Perubahan | Nilai |
+| :--- | :--- |
+| `ful-02.status` | **CANCELLED** |
+| Lines `fl-02` | diabaikan rollup (policy: exclude cancelled fulfill) |
+| `plan-02.fulfill_status` | **PARTIAL** (24/30 room-nights dari Agoda saja) |
+
+**Narasi:** **Plan 60 jt tidak dihapus** — masih target. Ops buat **`ful-03`** baru ke vendor lain untuk 6 room-nights sisa tanpa mengedit history `ful-02`.
+
+---
+
+## Ringkasan dashboard trip (contoh angka)
+
+Per **plan item** (committed dari lines, paid = alokasi sederhana):
+
+| plan | Budget | Committed | Paid (≈) | Catatan |
+| :--- | ---: | ---: | ---: | :--- |
+| plan-01 FLIGHT | 375 jt | 375 jt | 375 jt | DP + pelunasan |
+| plan-02 HOTEL | 60 jt | 63 jt → 48 jt* | 48 jt | *setelah cancel Direct |
+| plan-03 TRANSFER | 8 jt | 8,7 jt | 0 | belum bill |
+| plan-04 TIPPING | 5 jt | 5 jt | 5 jt | |
+| plan-05 ATTRACTION | 37,5 jt | 0 | 0 | belum booking |
+
+**Di luar plan:**
+
+| Sumber | Committed / cost |
+| :--- | ---: |
+| `ful-50` UNPLANNED | 6 jt committed |
+| `trip_cost_links` expense | 350 rb paid |
+
+---
+
+## Cheat sheet relasi
+
+```text
+trip_plan_items (1) ──< fulfillment_lines >── (N) fulfillments
+fulfillments (1) ──< fulfillment_flight_segments
+fulfillments (1) ──< fulfillment_detail_fields
+fulfillments (1) ──< fulfillment_cash_events     ← mirror finance
+hub.trips (1) ──< trip_cost_links                 ← expense langsung
 ```
 
 ---
 
-## Traceability Matrix (BRD → Schema)
+## Lihat juga
 
-| BRD Requirement | Dipenuhi oleh |
-| --- | --- |
-| REQ-4.1.1 (Realm isolation) | `realms`, `realm_id` di semua tabel identitas + unique index per-realm |
-| REQ-4.1.2 (UI Branding) | `realms.brand_settings` |
-| REQ-4.2.1 (App registration) | `apps` |
-| REQ-4.2.2 (Zero-downtime secret rotation) | `app_secrets` (multi-row per app + `expires_at`) |
-| REQ-4.2.3 (Token lifetime per app) | `apps.max_access_token_lifetime` |
-| REQ-4.2.4 (Refresh Token + RTR) | **[DRAFT]** `refresh_tokens` + `apps.max_refresh_token_lifetime` |
-| REQ-4.3.1 (Email + Password auth) | `user_credentials.email`, `password_hash` |
-| REQ-4.3.2 (No plaintext password) | Semua kolom `*_hash`, `totp_secret` encrypted |
-| REQ-4.3.3 (Passkey schema ready) | `user_passkeys` + `sign_count` |
-| REQ-4.3.4 (MFA: TOTP & Email OTP) | `user_credentials.use_2fa`, `totp_secret`; Email OTP di Redis |
-| REQ-4.3.5 (MFA enforcement per realm) | `realms.enforce_mfa` |
-| REQ-4.3.6 (Account lockout) | `realms.max_incorrect_password` (5), `lockout_duration_seconds`, `user_credentials.login_attempt`, `locked_until` |
-| REQ-4.3.7 (Account recovery) | `realms.allowed_recover_account` + recovery token di Redis |
-| REQ-4.3.8 (Social login) | `user_federated_identities` |
-| REQ-4.3.9 (LDAP/AD — Phase 2) | `realms.login_strategy`, `ldap_config` |
-| REQ-4.4.1–4.4.3 (Dynamic RBAC) | `permissions`, `roles`, `role_permissions`, `user_roles` |
-| REQ-4.4.4 (Realm vs Client roles) | `roles.realm_id` + `roles.app_id` nullable |
-| REQ-4.5.1–4.5.3 (API Keys) | `user_api_keys` (SHA-256 hash, prefix) |
-| REQ-4.5.4 (API Key scoping) | `api_key_permissions` |
-| Bab 4.6 Step 2/4 (Redirect validation) | `apps.redirect_uris` |
-| Bab 4.6 Step 7 (Single Logout) | `apps.backchannel_logout_uri` + **[DRAFT]** `sso_sessions` |
-| NFR-2 (B-Tree via unique constraint) | Unique index di semua kolom hash & identifier |
-| NFR-3 (Epoch timestamps) | `created_at`/`updated_at` BIGINT di semua tabel |
-| NFR-5 (Audit logging) | `audit_logs` (immutable, insert-only) |
-| BRD NFR-01 (Distributed Tracing) | `audit_logs.trace_id` |
-| BRD NFR-02 (Standar ORM & Soft Delete) | `user_credentials.deleted_at` (menggantikan `is_deleted`) |
-| BRD NFR-03 (UU PDP Data Retention) | Catatan Implementasi Tambahan (Automated Data Masking/Wipe job) |
-| BRD NFR-04 (Arsitektur Sesi Hibrida) | Tabel `sso_sessions` (*Stateful IdP*) & Penerbitan JWT untuk Klien (*Stateless*) |
+- [hub_supply_engine.sql](../SQL/hub_supply_engine.sql) — DDL
+- [hub_plan_lines_and_flights.md](./hub_plan_lines_and_flights.md) — prep checklist/finance seed (legacy naming)
+- [lite_erp.md](./lite_erp.md) — SoT expense & payment
